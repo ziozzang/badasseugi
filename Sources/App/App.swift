@@ -26,6 +26,7 @@ final class Settings: ObservableObject {
     /// Files processed at the same time. Recognition scales ~2x up to 3 jobs on an M1 (measured).
     @AppStorage("concurrency") var concurrency = Settings.defaultConcurrency
     @AppStorage("skipExisting") var skipExisting = true
+    @AppStorage("autoRetry") var autoRetry = true
 
     static var defaultConcurrency: Int {
         var n: Int32 = 0; var size = MemoryLayout<Int32>.size
@@ -112,6 +113,7 @@ struct SamiGenApp: App {
         .commands {
             CommandGroup(replacing: .newItem) {}
             CommandGroup(after: .appInfo) { CheckForUpdatesButton() }
+            QueueCommands(queue: queue)
         }
         SwiftUI.Settings { SettingsView().environmentObject(settings) }
     }
@@ -135,12 +137,14 @@ struct MainView: View {
     @EnvironmentObject var settings: Settings
     @EnvironmentObject var queue: JobQueue
     @State private var dropHover = false
-    @State private var appleConfig: TranslationSession.Configuration?
 
     var body: some View {
         VStack(spacing: 0) {
+            controlBar
+            Divider()
             optionsBar
             Divider()
+            ForEach(queue.packs) { PackBanner(pack: $0) }
             ZStack {
                 if queue.jobs.isEmpty {
                     DropHint(active: dropHover)
@@ -179,7 +183,33 @@ struct MainView: View {
             }
             .padding(.horizontal, 12).padding(.vertical, 8)
         }
-        .translationTask(appleConfig) { session in try? await session.prepareTranslation() }
+        // Language-pack downloads requested by the queue (system prompt needs a window).
+        .translationTask(queue.downloadConfig) { session in await queue.performDownload(session) }
+    }
+
+    /// ▶ Start / ⏹ Stop / ↻ Resume All
+    private var controlBar: some View {
+        HStack(spacing: 10) {
+            Button { queue.active ? queue.stopQueue() : queue.startQueue() } label: {
+                Label(queue.active ? "정지" : "시작", systemImage: queue.active ? "stop.fill" : "play.fill")
+                    .frame(minWidth: 48)
+            }
+            .buttonStyle(.borderedProminent)
+            .tint(queue.active ? .red : .accentColor)
+            .help(queue.active ? "정지: 실행 중인 작업은 저장 후 대기로 돌아가고, 새 작업을 시작하지 않습니다 (⌘.)"
+                               : "시작: 대기 중인 작업을 처리합니다 (⌘.)")
+            Button { queue.resumeAll() } label: {
+                Label("모두 재개\(queue.resumableCount > 0 ? " (\(queue.resumableCount))" : "")", systemImage: "arrow.clockwise")
+            }
+            .disabled(queue.resumableCount == 0)
+            .help("일시정지·실패·언어 팩 대기 작업을 모두 저장된 지점부터 다시 진행합니다 (⇧⌘R)")
+            Circle().fill(queue.active ? (queue.running.isEmpty ? Color.secondary : .green) : .orange).frame(width: 8, height: 8)
+            Text(queue.active ? (queue.running.isEmpty ? "대기열 켜짐" : "처리 중 \(queue.running.count)/\(queue.maxConcurrent)") : "정지됨 — ▶ 시작으로 이어서 진행")
+                .font(.caption).foregroundStyle(.secondary)
+            Spacer()
+        }
+        .padding(.horizontal, 12).padding(.vertical, 6)
+        .background(.bar)
     }
 
     private var footer: String {
@@ -188,8 +218,12 @@ struct MainView: View {
         func count(_ f: (Job.State) -> Bool) -> Int { queue.jobs.filter { f($0.state) }.count }
         let done = count { if case .done = $0 { true } else if case .skipped = $0 { true } else { false } }
         let waiting = count { $0 == .waiting }, paused = count { $0 == .paused }
+        let failed = count { if case .failed = $0 { true } else { false } }
+        let packs = count { if case .needsPack = $0 { true } else { false } }
         var parts = ["실행 \(queue.running.count)/\(queue.maxConcurrent)", "대기 \(waiting)"]
         if paused > 0 { parts.append("일시정지 \(paused)") }
+        if failed > 0 { parts.append("실패 \(failed)") }
+        if packs > 0 { parts.append("언어 팩 대기 \(packs)") }
         parts.append("완료 \(done)/\(total)")
         return parts.joined(separator: " · ") + "  —  드래그로 순서(우선순위) 변경"
     }
@@ -218,13 +252,8 @@ struct MainView: View {
                 .fixedSize()
             }
             if settings.translator == .apple {
-                Button("언어 팩") {
-                    let src = settings.sourceCode == "auto" ? "en" : settings.sourceCode
-                    let cfg = TranslationSession.Configuration(source: Locale.Language(identifier: src),
-                                                               target: Locale.Language(identifier: settings.targetCode))
-                    if appleConfig == cfg { appleConfig?.invalidate() } else { appleConfig = cfg }
-                }
-                .help("Apple 온디바이스 번역 언어 팩 다운로드")
+                Button("언어 팩") { queue.requestPackManually(source: settings.sourceCode, target: settings.targetCode) }
+                    .help("Apple 온디바이스 번역 언어 팩 다운로드 (음성 언어가 '자동 감지'면 영어 기준)")
             }
             Spacer()
             SettingsLink { Image(systemName: "gearshape") }.help("설정 (⌘,)")
@@ -297,6 +326,7 @@ struct JobRow: View {
         case .running: "\(Int(job.progress * 100))%"
         case .waiting: job.progress > 0 ? "대기 \(Int(job.progress * 100))%" : "대기"
         case .paused: "일시정지 \(Int(job.progress * 100))%"
+        case .needsPack: "언어 팩 대기"
         case .done: "완료"
         case .skipped: "건너뜀"
         case .failed: "실패"
@@ -308,6 +338,7 @@ struct JobRow: View {
         switch job.state {
         case .done: .green
         case .skipped: .teal
+        case .needsPack: .orange
         case .failed: .red
         case .paused: .orange
         case .cancelled: .secondary
@@ -330,6 +361,10 @@ struct JobRow: View {
                 Button { queue.startNow(job) } label: { Image(systemName: "bolt.circle") }
                     .help("지금 시작: 맨 위로 올리고 바로 실행 (자리가 없으면 가장 낮은 순위 작업이 저장 후 양보)")
                 Button { queue.pause(job) } label: { Image(systemName: "pause.circle") }.help("일시정지")
+                Button { queue.cancel(job) } label: { Image(systemName: "xmark.circle") }.help("취소")
+            case .needsPack:
+                Button { queue.resumeAll() } label: { Image(systemName: "arrow.down.circle") }
+                    .help("언어 팩이 설치되면 자동으로 이어서 진행합니다. 상단 배너에서 다시 받을 수 있습니다.")
                 Button { queue.cancel(job) } label: { Image(systemName: "xmark.circle") }.help("취소")
             case .paused:
                 Button { queue.resume(job) } label: { Image(systemName: "play.circle") }.help("재개 (대기열로)")
@@ -370,6 +405,47 @@ struct JobRow: View {
     }
 }
 
+/// Menu bar: 대기열 menu.
+struct QueueCommands: Commands {
+    @ObservedObject var queue: JobQueue
+    var body: some Commands {
+        CommandMenu("대기열") {
+            Button(queue.active ? "정지" : "시작") { queue.active ? queue.stopQueue() : queue.startQueue() }
+                .keyboardShortcut(".", modifiers: .command)
+            Button("모두 재개") { queue.resumeAll() }
+                .keyboardShortcut("r", modifiers: [.command, .shift])
+                .disabled(queue.resumableCount == 0)
+            Divider()
+            Button("완료 항목 지우기") { queue.clearFinished() }.disabled(!queue.hasFinished)
+        }
+    }
+}
+
+/// Shown while jobs wait for an Apple translation language pack.
+struct PackBanner: View {
+    let pack: JobQueue.PackRequest
+    @EnvironmentObject var queue: JobQueue
+    var body: some View {
+        HStack(spacing: 10) {
+            Image(systemName: pack.failed ? "exclamationmark.triangle.fill" : "arrow.down.circle")
+                .foregroundStyle(pack.failed ? .red : .orange)
+            VStack(alignment: .leading, spacing: 1) {
+                Text("Apple 번역 언어 팩 필요: \(pack.label)").font(.callout.weight(.medium))
+                Text(pack.status + " · 설치되면 해당 작업이 자동으로 이어서 진행됩니다").font(.caption).foregroundStyle(.secondary)
+            }
+            Spacer()
+            Button("다시 받기") { queue.download(pack.id) }
+            Button("시스템 설정에서 받기") {
+                // 일반 > 언어 및 지역 > 번역 언어… (가장 확실한 설치 경로)
+                NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.Localization-Settings.extension")!)
+            }
+            .help("시스템 설정 > 일반 > 언어 및 지역 > 번역 언어… 에서 받으면 자동으로 감지합니다")
+        }
+        .padding(.horizontal, 12).padding(.vertical, 8)
+        .background(Color.orange.opacity(0.12))
+    }
+}
+
 struct SettingsView: View {
     @EnvironmentObject var settings: Settings
     var body: some View {
@@ -384,6 +460,7 @@ struct SettingsView: View {
                 Text("M1 측정: 3개 동시 처리 시 약 2배 빠름 (그 이상은 효과가 거의 없음). 기본값 \(Settings.defaultConcurrency)")
                     .font(.caption).foregroundStyle(.secondary)
                 Toggle("같은 이름의 .smi 가 이미 있으면 건너뛰기", isOn: $settings.skipExisting)
+                Toggle("실패하면 자동 재시도 (최대 3회, 저장된 지점부터)", isOn: $settings.autoRetry)
                 Text("진행 중인 작업은 동영상 옆 '이름.smi.tmp' 에 수시로 저장되어, 종료·충돌 후에도 이어서 진행됩니다. 완료되면 삭제됩니다.")
                     .font(.caption).foregroundStyle(.secondary)
             }
@@ -422,34 +499,35 @@ enum SelfTest {
             let s: String = switch j.state {
             case .waiting: "waiting"; case .running: "RUNNING"; case .paused: "paused"
             case .done: "done"; case .skipped: "skipped"; case .failed(let m): "failed(\(m.prefix(30)))"; case .cancelled: "cancelled"
+            case .needsPack(let k): "needsPack(\(k))"
             }
             return "\(j.url.deletingPathExtension().lastPathComponent)=\(s)\(Int(j.progress * 100))%"
         }
         FileHandle.standardError.write("[selftest] \(step): \(states.joined(separator: " "))\n".data(using: .utf8)!)
     }
 
+    static func settle(_ q: JobQueue) async {
+        while !q.running.allSatisfy({ $0.stopReason == nil }) { try? await Task.sleep(for: .milliseconds(200)) }
+    }
+
     static func run(queue q: JobQueue, files: [URL]) {
         Task {
             q.add(files)
-            log(q, "added (slots \(q.maxConcurrent))")
-            try? await Task.sleep(for: .seconds(3))
-            log(q, "t=3s")
-            if let last = q.jobs.last { q.startNow(last); log(q, "startNow(\(last.url.lastPathComponent)) requested") }
-            try? await Task.sleep(for: .seconds(2))
-            log(q, "t=5s after preemption")
-            if let r = q.running.first { q.pause(r); log(q, "pause(\(r.url.lastPathComponent)) requested") }
-            try? await Task.sleep(for: .seconds(2))
-            log(q, "t=7s")
-            if let p = q.jobs.first(where: { $0.state == .paused }) { q.resume(p); log(q, "resume(\(p.url.lastPathComponent))") }
-            if q.jobs.count > 2 { q.move(fromOffsets: IndexSet(integer: q.jobs.count - 1), toOffset: 0); log(q, "dragged last to top") }
-            while q.jobs.contains(where: { $0.isActive }) {
-                try? await Task.sleep(for: .seconds(5)); log(q, "…")
+            log(q, "added (slots \(q.maxConcurrent), active \(q.active))")
+            try? await Task.sleep(for: .seconds(8))
+            log(q, "t=8s")
+            q.stopQueue(); log(q, "STOP requested (active=\(q.active))")
+            await settle(q); log(q, "stopped → expect no RUNNING, progress kept")
+            if let first = q.jobs.first { q.pause(first); log(q, "pause(\(first.url.lastPathComponent)) while stopped") }
+            q.startQueue(); log(q, "START")
+            try? await Task.sleep(for: .seconds(4))
+            log(q, "t+4s after start → paused one stays paused, others resume from saved %")
+            q.resumeAll(); log(q, "RESUME ALL")
+            while q.jobs.contains(where: { $0.state == .running || $0.state == .waiting }) {
+                try? await Task.sleep(for: .seconds(4)); log(q, "…")
             }
             log(q, "ALL FINISHED")
-            q.add(files)   // re-adding finished files must skip (existing .smi)
-            try? await Task.sleep(for: .seconds(1))
-            log(q, "re-added same files")
-            DispatchQueue.main.async { NSApp.terminate(nil) }   // outside this main-actor job
+            DispatchQueue.main.async { NSApp.terminate(nil) }
         }
     }
 }

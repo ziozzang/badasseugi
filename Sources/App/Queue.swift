@@ -2,6 +2,7 @@ import Foundation
 import Combine
 import CryptoKit
 import UniformTypeIdentifiers
+import Translation
 
 // MARK: - Checkpoint files
 
@@ -11,8 +12,10 @@ enum CheckpointStore {
     static func tmpURL(for media: URL) -> URL { media.deletingPathExtension().appendingPathExtension("smi.tmp") }
 
     static var supportDir: URL {
-        let d = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("SAMI Gen", isDirectory: true)
+        // SAMIGEN_SUPPORT_DIR: isolated data dir for tests. ("SAMI Gen" kept for continuity with earlier builds.)
+        let d = ProcessInfo.processInfo.environment["SAMIGEN_SUPPORT_DIR"].map { URL(fileURLWithPath: $0) }
+            ?? FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+                .appendingPathComponent("SAMI Gen", isDirectory: true)
         try? FileManager.default.createDirectory(at: d, withIntermediateDirectories: true)
         return d
     }
@@ -51,6 +54,7 @@ enum CheckpointStore {
 final class Job: ObservableObject, Identifiable {
     enum State: Equatable {
         case waiting, running, paused
+        case needsPack(String)          // waiting for an Apple translation language pack (key "src>tgt")
         case done(URL), skipped(URL), failed(String), cancelled
     }
     /// Why a running job is being stopped (all save a checkpoint first).
@@ -66,11 +70,17 @@ final class Job: ObservableObject, Identifiable {
     var stopReason: StopReason?
     var cancelHandler: (() -> Void)?
     var started: Date?
+    var retries = 0                // automatic retries after failures
 
     init(url: URL, id: UUID = UUID()) { self.url = url; self.id = id }
 
     /// Still owes work (not finished).
-    var isActive: Bool { [.waiting, .running, .paused].contains(state) }
+    var isActive: Bool {
+        switch state { case .waiting, .running, .paused, .needsPack: true; default: false }
+    }
+    var isResumable: Bool {
+        switch state { case .paused, .failed, .needsPack: true; default: false }
+    }
     var outputURL: URL { url.deletingPathExtension().appendingPathExtension("smi") }
 }
 
@@ -92,6 +102,14 @@ private struct PersistedJob: Codable {
 @MainActor
 final class JobQueue: ObservableObject {
     @Published private(set) var jobs: [Job] = []
+    /// Queue switch (Start / Stop). Persisted: a stopped queue stays stopped after relaunch.
+    @Published private(set) var active = UserDefaults.standard.object(forKey: "queueActive") as? Bool ?? true
+    /// Language packs jobs are waiting for.
+    @Published private(set) var packs: [PackRequest] = []
+    /// Drives `.translationTask` in the main window (the only way to show the system download prompt).
+    @Published var downloadConfig: TranslationSession.Configuration?
+    private var downloadingKey: String?
+    private var packPoller: Task<Void, Never>?
     let settings: Settings
     private var watchers: [UUID: AnyCancellable] = [:]
     private var saveScheduled = false
@@ -167,6 +185,7 @@ final class JobQueue: ObservableObject {
 
     /// Fill free slots with the highest waiting jobs (list order = priority).
     func pump() {
+        guard active else { return }
         while running.count < maxConcurrent, let next = jobs.first(where: { $0.state == .waiting }) {
             start(next)
         }
@@ -188,6 +207,7 @@ final class JobQueue: ObservableObject {
         })
         let work = Task { try await gen.run() }
         job.cancelHandler = { work.cancel() }
+        preflightLanguagePack()
         Task {
             await finish(job, gen: gen, work: work)
             pump()
@@ -219,9 +239,28 @@ final class JobQueue: ObservableObject {
                     CheckpointStore.remove(job.url)
                     job.state = .cancelled; job.phase = "취소됨"
                 }
+            } else if let missing = error as? LanguagePackMissing {
+                // Not a failure: wait for the pack (recognition is checkpointed), resume when installed.
+                job.state = .needsPack(missing.key)
+                job.phase = "언어 팩 대기: \(missing.source.label) → \(missing.target.label) · \(pct)까지 저장됨"
+                requestPack(missing.source, missing.target, auto: true)
             } else {
-                // Real failure: keep the checkpoint so "다시 시도" resumes.
-                job.state = .failed(error.localizedDescription); job.phase = "실패 · \(pct)까지 저장됨"
+                // Real failure: keep the checkpoint so retries resume where it stopped.
+                job.state = .failed(error.localizedDescription)
+                if settings.autoRetry && job.retries < 3 {
+                    job.retries += 1
+                    let delay = 30 * job.retries
+                    job.phase = "실패 · \(pct)까지 저장됨 · \(delay)초 후 자동 재시도 (\(job.retries)/3)"
+                    let id = job.id
+                    Task {
+                        try? await Task.sleep(for: .seconds(Double(delay)))
+                        guard let j = jobs.first(where: { $0.id == id }), case .failed = j.state else { return }
+                        j.state = .waiting; j.phase = "자동 재시도 대기 (\(j.retries)/3)"
+                        pump()
+                    }
+                } else {
+                    job.phase = "실패 · \(pct)까지 저장됨"
+                }
             }
         }
         job.stopReason = nil
@@ -229,7 +268,9 @@ final class JobQueue: ObservableObject {
 
     private func stop(_ job: Job, _ reason: Job.StopReason) {
         guard job.state == .running else { return }
-        job.stopReason = reason
+        // Model loading can't be interrupted, so the actual stop may take a few seconds.
+        if job.stopReason == nil || reason == .cancel || (reason == .pause && job.stopReason != .cancel) { job.stopReason = reason }
+        job.phase = reason == .cancel ? "취소하는 중…" : "저장하고 멈추는 중…"
         job.cancelHandler?()
     }
 
@@ -270,7 +311,7 @@ final class JobQueue: ObservableObject {
     func cancel(_ job: Job) {
         switch job.state {
         case .running: stop(job, .cancel)
-        case .waiting, .paused:
+        case .waiting, .paused, .needsPack:
             CheckpointStore.remove(job.url)
             job.state = .cancelled; job.phase = "취소됨"
         default: break
@@ -278,6 +319,7 @@ final class JobQueue: ObservableObject {
     }
 
     func retry(_ job: Job) {
+        job.retries = 0
         job.state = .waiting
         job.phase = CheckpointStore.load(job.url) != nil ? "이어서 진행 대기" : "대기 중"
         job.detail = ""
@@ -307,6 +349,127 @@ final class JobQueue: ObservableObject {
         for j in jobs where !j.isActive { watchers[j.id] = nil }
         jobs.removeAll { !$0.isActive }
         save()
+    }
+
+    // MARK: Queue-wide (Start / Stop / Resume All)
+
+    private func setActive(_ on: Bool) {
+        active = on
+        UserDefaults.standard.set(on, forKey: "queueActive")
+    }
+
+    /// ▶ Start: let the queue run waiting jobs.
+    func startQueue() {
+        setActive(true)
+        pump()
+    }
+
+    /// ⏹ Stop: running jobs save a checkpoint and go back to waiting; nothing new starts.
+    func stopQueue() {
+        setActive(false)
+        for j in running { stop(j, .quit) }
+    }
+
+    var resumableCount: Int { jobs.filter(\.isResumable).count }
+
+    /// ↻ Resume All: paused, failed and language-pack-waiting jobs go back to waiting (from their checkpoints).
+    func resumeAll() {
+        for j in jobs where j.isResumable {
+            if case .needsPack(let key) = j.state, packs.contains(where: { $0.id == key }) {
+                continue   // still not installed: stays waiting for the pack
+            }
+            j.retries = 0
+            j.state = .waiting
+            j.phase = CheckpointStore.load(j.url) != nil ? "이어서 진행 대기 (\(Int(j.progress * 100))%)" : "대기 중"
+        }
+        startQueue()
+    }
+
+    // MARK: Apple language packs
+
+    struct PackRequest: Identifiable, Equatable {
+        let source: Language
+        let target: Language
+        var id: String { "\(source.code)>\(target.code)" }
+        var label: String { "\(source.label) → \(target.label)" }
+        var attempts = 0
+        var status = "다운로드 요청 중…"
+        var failed = false
+    }
+
+    /// Asks for a download (system prompt) — automatically only once per pair, then via the banner button.
+    func requestPack(_ source: Language, _ target: Language, auto: Bool) {
+        let key = "\(source.code)>\(target.code)"
+        if !packs.contains(where: { $0.id == key }) { packs.append(PackRequest(source: source, target: target)) }
+        if let i = packs.firstIndex(where: { $0.id == key }), !auto || packs[i].attempts == 0 {
+            download(key)
+        }
+        startPackPoller()
+    }
+
+    func download(_ key: String) {
+        guard let i = packs.firstIndex(where: { $0.id == key }) else { return }
+        packs[i].attempts += 1
+        packs[i].failed = false
+        packs[i].status = "다운로드 중… (시도 \(packs[i].attempts))"
+        downloadingKey = key
+        let cfg = TranslationSession.Configuration(source: Locale.Language(identifier: packs[i].source.code),
+                                                   target: Locale.Language(identifier: packs[i].target.code))
+        if downloadConfig == cfg { downloadConfig?.invalidate() } else { downloadConfig = cfg }
+    }
+
+    /// Called from the main window's `.translationTask` with the session for `downloadConfig`.
+    func performDownload(_ session: TranslationSession) async {
+        let key = downloadingKey
+        do {
+            try await session.prepareTranslation()
+            if let key, let i = packs.firstIndex(where: { $0.id == key }) { packs[i].status = "설치 확인 중…" }
+        } catch {
+            if let key, let i = packs.firstIndex(where: { $0.id == key }) {
+                packs[i].failed = true
+                packs[i].status = "다운로드 실패: \(error.localizedDescription)"
+            }
+        }
+        await checkPacks()
+    }
+
+    /// Poll installation (also catches installs done in System Settings) and release waiting jobs.
+    private func startPackPoller() {
+        guard packPoller == nil else { return }
+        packPoller = Task {
+            while !packs.isEmpty {
+                await checkPacks()
+                try? await Task.sleep(for: .seconds(5))
+            }
+            packPoller = nil
+        }
+    }
+
+    private func checkPacks() async {
+        for p in packs where await LanguagePackMissing.status(p.source, p.target) == .installed {
+            packs.removeAll { $0.id == p.id }
+            for j in jobs {
+                if case .needsPack(let key) = j.state, key == p.id {
+                    j.state = .waiting; j.phase = "언어 팩 설치됨 · 이어서 진행 대기"
+                }
+            }
+            pump()
+        }
+    }
+
+    /// Fixed language pair + Apple translator: request the pack while recognition is still running.
+    private func preflightLanguagePack() {
+        let o = settings.options
+        guard o.translator == .apple, o.layout != .original, o.sourceCode != "auto", o.sourceCode != o.targetCode else { return }
+        let src = Language.byCode(o.sourceCode), tgt = Language.byCode(o.targetCode)
+        Task {
+            if await LanguagePackMissing.status(src, tgt) == .supported { requestPack(src, tgt, auto: true) }
+        }
+    }
+
+    /// Manual request from the options bar ("언어 팩" button).
+    func requestPackManually(source: String, target: String) {
+        requestPack(Language.byCode(source == "auto" ? "en" : source), Language.byCode(target), auto: false)
     }
 
     // MARK: Ordering (priority)
@@ -355,7 +518,7 @@ final class JobQueue: ObservableObject {
         let list = jobs.map { j -> PersistedJob in
             var state = "waiting", output: String?, err: String?
             switch j.state {
-            case .waiting, .running: state = "waiting"          // running resumes as waiting
+            case .waiting, .running, .needsPack: state = "waiting"   // re-evaluated on next run
             case .paused: state = "paused"
             case .done(let u): state = "done"; output = u.path
             case .skipped(let u): state = "skipped"; output = u.path
