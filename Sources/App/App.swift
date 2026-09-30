@@ -120,6 +120,7 @@ struct SamiGenApp: App {
 @main
 enum Main {
     static func main() {
+        Updater.handleCommandLineIfRequested()   // `--update [--check]`
         if CommandLine.arguments.contains("--cli") {
             CLI.run()
         } else {

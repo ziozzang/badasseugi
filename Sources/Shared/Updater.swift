@@ -40,13 +40,13 @@ final class Updater: ObservableObject {
         currentVersion = bundle.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0"
     }
 
-    var enabled: Bool {
-        !repo.isEmpty && ProcessInfo.processInfo.environment["NO_UPDATE_CHECK"] == nil
-    }
+    var enabled: Bool { !repo.isEmpty }
+    /// Automatic (background) checks can be turned off with NO_UPDATE_CHECK=1.
+    var automaticEnabled: Bool { enabled && ProcessInfo.processInfo.environment["NO_UPDATE_CHECK"] == nil }
 
     /// Background check on launch / periodically; prompts only for versions the user hasn't skipped.
     func checkIfDue() {
-        guard enabled else { return }
+        guard automaticEnabled else { return }
         let last = UserDefaults.standard.double(forKey: lastCheckKey)
         guard Date().timeIntervalSince1970 - last >= checkInterval else { return }
         Task { await check(userInitiated: false) }
@@ -54,7 +54,7 @@ final class Updater: ObservableObject {
 
     /// Schedules `checkIfDue` on launch and then every few hours (cheap: it only hits the API once a day).
     func startAutomaticChecks() {
-        guard enabled else { return }
+        guard automaticEnabled else { return }
         Task {
             try? await Task.sleep(for: .seconds(5))
             checkIfDue()
@@ -130,61 +130,95 @@ final class Updater: ObservableObject {
 
     /// Downloads, verifies and installs `available`, then quits (the helper relaunches the new version).
     func installAndRelaunch() async {
-        guard let rel = available, !busy else { return }
-        busy = true
-        defer { busy = false }
+        guard available != nil, !busy else { return }
         do {
-            let appURL = Bundle.main.bundleURL
-            let parent = appURL.deletingLastPathComponent()
-            guard FileManager.default.isWritableFile(atPath: parent.path) else {
-                throw UpdateError("No write permission for \(parent.path). Move the app to a writable folder (e.g. /Applications or ~/Applications).")
-            }
-            status = "Downloading \(rel.version)…"
-            let (sumData, _) = try await URLSession.shared.data(for: request(rel.checksumsURL))
-            let sums = String(decoding: sumData, as: UTF8.self)
-            guard let want = sums.split(separator: "\n").compactMap({ line -> String? in
-                let f = line.split(whereSeparator: \.isWhitespace)
-                return f.count == 2 && f[1] == Substring(rel.assetName) ? String(f[0]).lowercased() : nil
-            }).first else { throw UpdateError("SHA256SUMS has no entry for \(rel.assetName)") }
-
-            let (tmpZip, _) = try await URLSession.shared.download(for: request(rel.assetURL))
-            let zipData = try Data(contentsOf: tmpZip, options: .mappedIfSafe)
-            let got = SHA256.hash(data: zipData).map { String(format: "%02x", $0) }.joined()
-            guard got == want else { throw UpdateError("Checksum mismatch (got \(got.prefix(12))…, want \(want.prefix(12))…)") }
-
-            status = "Installing \(rel.version)…"
-            let work = FileManager.default.temporaryDirectory.appendingPathComponent("update-\(UUID().uuidString)")
-            try FileManager.default.createDirectory(at: work, withIntermediateDirectories: true)
-            try Self.run("/usr/bin/ditto", ["-x", "-k", tmpZip.path, work.path])
-            guard let newApp = try FileManager.default.contentsOfDirectory(at: work, includingPropertiesForKeys: nil)
-                    .first(where: { $0.pathExtension == "app" }) else { throw UpdateError("No .app in the update archive") }
-            let newVersion = Bundle(url: newApp)?.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String
-            guard newVersion == rel.version else { throw UpdateError("Archive contains version \(newVersion ?? "?"), expected \(rel.version)") }
-            // Stage next to the current app (same volume → atomic rename).
-            let staged = parent.appendingPathComponent(".\(appURL.lastPathComponent).update")
-            try? FileManager.default.removeItem(at: staged)
-            try FileManager.default.moveItem(at: newApp, to: staged)
-            try? Self.run("/usr/bin/xattr", ["-dr", "com.apple.quarantine", staged.path])
-
-            let script = """
-            while /bin/kill -0 \(ProcessInfo.processInfo.processIdentifier) 2>/dev/null; do /bin/sleep 0.3; done
-            OLD="\(appURL.path)"; NEW="\(staged.path)"; BAK="$OLD.old"
-            /bin/rm -rf "$BAK"
-            /bin/mv "$OLD" "$BAK" && /bin/mv "$NEW" "$OLD" && /bin/rm -rf "$BAK" || { /bin/mv "$BAK" "$OLD" 2>/dev/null; }
-            /usr/bin/open "$OLD"
-            """
-            let helper = Process()
-            helper.executableURL = URL(fileURLWithPath: "/bin/sh")
-            helper.arguments = ["-c", script]
-            helper.standardOutput = FileHandle.nullDevice
-            helper.standardError = FileHandle.nullDevice
-            try helper.run()   // survives our exit (not waited on)
+            try await install(relaunch: true)
             status = "Restarting…"
             NSApp.terminate(nil)
         } catch {
             status = "Update failed: \(error.localizedDescription)"
             showPrompt = true
         }
+    }
+
+    /// Download → verify SHA-256 → unzip → stage next to the app → detached helper swaps the bundle
+    /// once this process has exited (and relaunches it if asked). The caller must then exit.
+    func install(relaunch: Bool) async throws {
+        guard let rel = available else { throw UpdateError("No update available") }
+        busy = true
+        defer { busy = false }
+        let appURL = Bundle.main.bundleURL
+        guard appURL.pathExtension == "app" else { throw UpdateError("Not running from an .app bundle") }
+        let parent = appURL.deletingLastPathComponent()
+        guard FileManager.default.isWritableFile(atPath: parent.path) else {
+            throw UpdateError("No write permission for \(parent.path). Move the app to a writable folder (e.g. /Applications or ~/Applications).")
+        }
+        status = "Downloading \(rel.version)…"
+        let (sumData, _) = try await URLSession.shared.data(for: request(rel.checksumsURL))
+        let sums = String(decoding: sumData, as: UTF8.self)
+        guard let want = sums.split(separator: "\n").compactMap({ line -> String? in
+            let f = line.split(whereSeparator: \.isWhitespace)
+            return f.count == 2 && f[1] == Substring(rel.assetName) ? String(f[0]).lowercased() : nil
+        }).first else { throw UpdateError("SHA256SUMS has no entry for \(rel.assetName)") }
+
+        let (tmpZip, _) = try await URLSession.shared.download(for: request(rel.assetURL))
+        let zipData = try Data(contentsOf: tmpZip, options: .mappedIfSafe)
+        let got = SHA256.hash(data: zipData).map { String(format: "%02x", $0) }.joined()
+        guard got == want else { throw UpdateError("Checksum mismatch (got \(got.prefix(12))…, want \(want.prefix(12))…)") }
+
+        status = "Installing \(rel.version)…"
+        let work = FileManager.default.temporaryDirectory.appendingPathComponent("update-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: work, withIntermediateDirectories: true)
+        try Self.run("/usr/bin/ditto", ["-x", "-k", tmpZip.path, work.path])
+        guard let newApp = try FileManager.default.contentsOfDirectory(at: work, includingPropertiesForKeys: nil)
+                .first(where: { $0.pathExtension == "app" }) else { throw UpdateError("No .app in the update archive") }
+        let newVersion = Bundle(url: newApp)?.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String
+        guard newVersion == rel.version else { throw UpdateError("Archive contains version \(newVersion ?? "?"), expected \(rel.version)") }
+        // Stage next to the current app (same volume → atomic rename).
+        let staged = parent.appendingPathComponent(".\(appURL.lastPathComponent).update")
+        try? FileManager.default.removeItem(at: staged)
+        try FileManager.default.moveItem(at: newApp, to: staged)
+        try? FileManager.default.removeItem(at: work)
+        try? Self.run("/usr/bin/xattr", ["-dr", "com.apple.quarantine", staged.path])
+
+        let script = """
+        while /bin/kill -0 \(ProcessInfo.processInfo.processIdentifier) 2>/dev/null; do /bin/sleep 0.3; done
+        OLD="\(appURL.path)"; NEW="\(staged.path)"; BAK="$OLD.old"
+        /bin/rm -rf "$BAK"
+        /bin/mv "$OLD" "$BAK" && /bin/mv "$NEW" "$OLD" && /bin/rm -rf "$BAK" || { /bin/mv "$BAK" "$OLD" 2>/dev/null; }
+        \(relaunch ? "/usr/bin/open \"$OLD\"" : "")
+        """
+        let helper = Process()
+        helper.executableURL = URL(fileURLWithPath: "/bin/sh")
+        helper.arguments = ["-c", script]
+        helper.standardOutput = FileHandle.nullDevice
+        helper.standardError = FileHandle.nullDevice
+        try helper.run()   // not waited on: it outlives this process
+        status = "Update \(rel.version) staged; it is applied when the app exits."
+    }
+
+    /// `App --update [--check] [--force]`: non-interactive update (like `sugyeol update`). Exits the process.
+    nonisolated static func handleCommandLineIfRequested() {
+        let args = CommandLine.arguments
+        guard args.contains("--update") else { return }
+        setvbuf(stdout, nil, _IOLBF, 0)
+        Task { @MainActor in
+            let u = Updater.shared
+            print("\(Bundle.main.object(forInfoDictionaryKey: "CFBundleName") ?? "app") \(u.currentVersion) · \(u.repo)")
+            await u.check(userInitiated: true)
+            print(u.status)
+            guard !u.status.hasPrefix("Update check failed") else { exit(1) }
+            guard let rel = u.available, !args.contains("--check") else { exit(0) }
+            do {
+                try await u.install(relaunch: false)
+                print("Installing \(rel.version) — replaced as soon as this process exits.")
+                exit(0)
+            } catch {
+                print("Update failed: \(error.localizedDescription)")
+                exit(1)
+            }
+        }
+        dispatchMain()
     }
 
     // MARK: Helpers
