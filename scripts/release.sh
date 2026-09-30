@@ -12,7 +12,6 @@ PLIST=Resources/Info.plist
 pb() { /usr/libexec/PlistBuddy -c "$1" "$PLIST"; }
 REPO=$(pb "Print :UpdateRepo"); PREFIX=$(pb "Print :UpdateAssetPrefix"); NAME=$(pb "Print :CFBundleName")
 [[ -z "$(git status --porcelain)" ]] || { echo "working tree not clean — commit first" >&2; exit 1; }
-git rev-parse -q --verify "refs/tags/v$VERSION" >/dev/null && { echo "tag v$VERSION already exists" >&2; exit 1; }
 
 TOKEN="${GITHUB_TOKEN:-$(grep -E '^(export )?GITHUB_TOKEN=' ~/env 2>/dev/null | head -1 | sed -E "s/^(export )?GITHUB_TOKEN=//; s/^[\"']//; s/[\"']\$//")}"
 [[ -n "$TOKEN" ]] || { echo "GITHUB_TOKEN not set" >&2; exit 1; }
@@ -22,6 +21,26 @@ printf 'Authorization: Bearer %s\nAccept: application/vnd.github+json\nX-GitHub-
 printf '%s' "$TOKEN" > "$PASS"; printf '#!/bin/sh\ncat "%s"\n' "$PASS" > "$ASK"   # git push over https without exposing the token
 unset TOKEN
 gitpush() { GIT_ASKPASS="$ASK" GIT_TERMINAL_PROMPT=0 git -c credential.helper= push "$@"; }
+
+upload_assets() {   # $1 = release id; uploads zip + SHA256SUMS unless already attached
+  local have=$(curl -sS -H @"$HDR" "https://api.github.com/repos/$REPO/releases/$1/assets" | python3 -c 'import json,sys; print(" ".join(a["name"] for a in json.load(sys.stdin)))')
+  for f in "$ZIP" SHA256SUMS; do
+    [[ " $have " == *" $f "* ]] && { echo "  $f already uploaded"; continue; }
+    local type=$([[ $f == *.zip ]] && echo application/zip || echo text/plain)
+    local res=$(curl -sS -H @"$HDR" -H "Content-Type: $type" --data-binary @"dist/$f" \
+      "https://uploads.github.com/repos/$REPO/releases/$1/assets?name=$f")
+    printf '%s' "$res" | python3 -c 'import json,sys; a=json.load(sys.stdin); assert a.get("state")=="uploaded", a; print("  uploaded", a["name"], a["size"])' \
+      || { echo "upload of $f failed: $(printf '%s' "$res" | head -c 300)" >&2; exit 1; }
+  done
+}
+ZIP="${PREFIX}_${VERSION}_macos_arm64.zip"
+
+# Resume: tag already released (e.g. an earlier run died during upload) → only upload what is missing.
+if git rev-parse -q --verify "refs/tags/v$VERSION" >/dev/null; then
+  EXIST=$(curl -sS -H @"$HDR" "https://api.github.com/repos/$REPO/releases/tags/v$VERSION" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("id",""))' || true)
+  [[ -n "$EXIST" && -f "dist/$ZIP" && -f dist/SHA256SUMS ]] || { echo "tag v$VERSION exists but no release/dist to resume" >&2; exit 1; }
+  echo "▶ resuming upload for existing release v$VERSION"; upload_assets "$EXIST"; exit 0
+fi
 
 # Notes: argument, or commit subjects since the previous tag.
 PREV=$(git describe --tags --abbrev=0 2>/dev/null || true)
@@ -33,7 +52,6 @@ pb "Set :CFBundleVersion $(( $(pb 'Print :CFBundleVersion') + 1 ))"
 ./build.sh release
 
 mkdir -p dist
-ZIP="${PREFIX}_${VERSION}_macos_arm64.zip"
 rm -f "dist/$ZIP" dist/SHA256SUMS
 ditto -c -k --sequesterRsrc --keepParent "build/$NAME.app" "dist/$ZIP"
 (cd dist && shasum -a 256 "$ZIP" > SHA256SUMS && cat SHA256SUMS)
@@ -48,12 +66,8 @@ import json, os
 print(json.dumps({"tag_name": "v"+os.environ["VERSION"], "name": os.environ["NAME"]+" v"+os.environ["VERSION"],
                   "body": os.environ["NOTES"], "draft": False, "prerelease": False}))')
 REL=$(curl -sS -H @"$HDR" -X POST "https://api.github.com/repos/$REPO/releases" -d "$BODY")
-ID=$(echo "$REL" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("id",""))')
-[[ -n "$ID" ]] || { echo "release creation failed: $REL" >&2; exit 1; }
-for f in "$ZIP" SHA256SUMS; do
-  TYPE=$([[ $f == *.zip ]] && echo application/zip || echo text/plain)
-  curl -sS -H @"$HDR" -H "Content-Type: $TYPE" --data-binary @"dist/$f" \
-    "https://uploads.github.com/repos/$REPO/releases/$ID/assets?name=$f" \
-    | python3 -c 'import json,sys; a=json.load(sys.stdin); print("  uploaded", a.get("name"), a.get("size"), a.get("state") or a)'
-done
+# printf, not echo: zsh's echo would interpret backslash escapes inside the JSON.
+ID=$(printf '%s' "$REL" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("id",""))' || true)
+[[ -n "$ID" ]] || { echo "release creation failed: $(printf '%s' "$REL" | head -c 500)" >&2; exit 1; }
+upload_assets "$ID"
 echo "✓ https://github.com/$REPO/releases/tag/v$VERSION"
